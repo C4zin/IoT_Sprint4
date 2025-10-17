@@ -10,7 +10,7 @@ import numpy as np
 import streamlit as st
 
 # ============================================================
-# 🔧 Garantia de dependências (ajuda local/colab).
+# 🔧 Garantia de dependências (ajuda local/Colab).
 #    Em produção (Streamlit Cloud) use requirements.txt.
 # ============================================================
 def ensure(pkg, pip_name=None):
@@ -109,11 +109,18 @@ def _clean_ultralytics_cache_for(weights_name: str):
 # Streamlit UI
 # ============================================================
 st.set_page_config(page_title="MotoTrack Vision - Streamlit", layout="wide")
+
+# guarda logs em tempo real para o dashboard
+if "rt_logs" not in st.session_state:
+    st.session_state["rt_logs"] = []   # [{frame,fps,motos_no_frame,motos_unicas,ts}]
+
 st.title("🏍️ MotoTrack Vision — YOLOv8 + ByteTrack (Streamlit)")
 st.caption("Detecção + Rastreamento de **motos** em vídeo, com métricas em tempo (quase) real, exportação CSV e MP4.")
 
-tab_sys, tab_app = st.tabs(["🖥️ Sistema", "🎬 Processamento"])
+# agora com Dashboard:
+tab_sys, tab_app, tab_dash = st.tabs(["🖥️ Sistema", "🎬 Processamento", "📊 Dashboard"])
 
+# ======================= Aba Sistema ========================
 with tab_sys:
     st.subheader("Informações do Sistema/GPU")
     import platform
@@ -133,6 +140,7 @@ with tab_sys:
     else:
         st.info("GPU NVIDIA não detectada (ou `nvidia-smi` indisponível).")
 
+# ==================== Aba Processamento =====================
 with tab_app:
     with st.sidebar:
         st.header("Parâmetros")
@@ -160,9 +168,7 @@ with tab_app:
 
     run_button = st.button("▶️ Processar vídeo enviado")
 
-    # -----------------------------
     # Carregamento robusto do modelo
-    # -----------------------------
     @st.cache_resource(show_spinner=True)
     def load_model_safely(name: str):
         try:
@@ -173,9 +179,7 @@ with tab_app:
 
     model = load_model_safely(model_name)
 
-    # -----------------------------
-    # Upload de vídeo
-    # -----------------------------
+    # Upload
     uploaded = st.file_uploader(
         "Envie um arquivo de vídeo (mp4, avi, mov, mkv…)", type=None, accept_multiple_files=False
     )
@@ -186,9 +190,7 @@ with tab_app:
     track_table_placeholder = metrics_col.empty()
     csv_preview_placeholder = st.empty()
 
-    # -----------------------------
     # Utilitários
-    # -----------------------------
     def _save_to_temp(uploaded_file) -> str:
         suffix = os.path.splitext(uploaded_file.name)[-1] or ".mp4"
         base = os.path.splitext(os.path.basename(uploaded_file.name))[0] or "input"
@@ -197,10 +199,10 @@ with tab_app:
             f.write(uploaded_file.read())
         return temp_path
 
-    # -----------------------------
-    # Pipeline de processamento
-    # -----------------------------
+    # Pipeline
     def process_video(input_path: str):
+        from datetime import datetime
+
         writer = None
         unique_ids = set()
         frame_count = 0
@@ -261,6 +263,18 @@ with tab_app:
                     sample_ids = list(unique_ids)[:10]
                 track_table_placeholder.write({"IDs rastreadas (amostra)": sample_ids})
 
+            # ---------- LOGS p/ DASHBOARD ----------
+            st.session_state["rt_logs"].append({
+                "ts": datetime.utcnow().isoformat(),
+                "frame": frame_count,
+                "fps": float(fps),
+                "motos_no_frame": int(len(ids)),
+                "motos_unicas": int(len(unique_ids)),
+            })
+            if len(st.session_state["rt_logs"]) > 5000:
+                st.session_state["rt_logs"] = st.session_state["rt_logs"][-2000:]
+            # ---------------------------------------
+
             if max_frames and frame_count >= max_frames:
                 break
 
@@ -274,9 +288,7 @@ with tab_app:
             "logs": logs,
         }
 
-    # -----------------------------
     # Execução
-    # -----------------------------
     summary = None
 
     if run_button:
@@ -303,3 +315,62 @@ with tab_app:
                     file_name="rastreamento_motos.csv",
                     mime="text/csv",
                 )
+
+# ======================= Aba Dashboard ======================
+with tab_dash:
+    st.subheader("📊 Dashboard em tempo (quase) real")
+
+    import pandas as pd
+
+    logs = st.session_state.get("rt_logs", [])
+    if not logs:
+        st.info("Nenhum dado ainda. Rode o processamento na aba **🎬 Processamento**.")
+    else:
+        df = pd.DataFrame(logs)
+
+        # KPIs
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Frames processados", int(df["frame"].max()))
+        c2.metric("FPS médio", f"{df['fps'].mean():.1f}")
+        c3.metric("Pico de motos/frame", int(df["motos_no_frame"].max()))
+        c4.metric("Motos únicas (total)", int(df["motos_unicas"].max()))
+
+        st.markdown("---")
+        st.write("### Séries temporais")
+
+        tcol1, tcol2 = st.columns(2)
+        with tcol1:
+            st.caption("FPS por frame")
+            st.line_chart(df.set_index("frame")["fps"])
+        with tcol2:
+            st.caption("Motos no frame")
+            st.line_chart(df.set_index("frame")["motos_no_frame"])
+
+        st.markdown("---")
+        st.write("### Últimos eventos")
+        st.dataframe(
+            df[["frame", "fps", "motos_no_frame", "motos_unicas", "ts"]]
+              .sort_values("frame", ascending=False)
+              .head(25),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.markdown("---")
+        st.write("### Alertas")
+
+        alerts = []
+        # regras simples (ajuste limiares conforme preferir)
+        if df["fps"].mean() < 12:
+            alerts.append("⚠️ **Baixo desempenho**: FPS médio abaixo de 12.")
+        if df["motos_no_frame"].max() >= 5:
+            alerts.append("🚦 **Alta densidade**: pico ≥ 5 motos no mesmo frame.")
+        last_row = df.sort_values("frame").iloc[-1]
+        if last_row["motos_no_frame"] == 0:
+            alerts.append("ℹ️ **Sem detecções no último frame**.")
+
+        if alerts:
+            for a in alerts:
+                st.write(a)
+        else:
+            st.success("✅ Nenhum alerta no momento.")
