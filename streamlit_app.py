@@ -1,5 +1,4 @@
 import os
-import cv2
 import time
 import sys
 import glob
@@ -11,9 +10,7 @@ import numpy as np
 import streamlit as st
 
 # ============================================================
-# 🔧 Instalação/garantia de dependências (fallback)
-#  - Em plataformas gerenciadas (Streamlit Cloud/Render), prefira requirements.txt
-#  - Isso aqui só dá uma ajudinha quando roda local/Colab
+# 🔧 Instalação/garantia de dependências
 # ============================================================
 def ensure(pkg, pip_name=None):
     pip_name = pip_name or pkg
@@ -22,10 +19,21 @@ def ensure(pkg, pip_name=None):
     except Exception:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pip_name])
 
+# Evita conflito entre opencv "normal" e o headless
+def ensure_cv2_headless():
+    try:
+        import cv2  # noqa
+        # se já existir cv2, checa se é headless; se não for, troca.
+        if hasattr(cv2, "__file__") and "headless" not in (cv2.__file__ or "").lower():
+            subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", "opencv-python", "opencv-contrib-python"])
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "opencv-python-headless==4.10.0.84"])
+    except Exception:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "opencv-python-headless==4.10.0.84"])
+
 # essenciais
-ensure("ultralytics")
+ensure("ultralytics")  # versão controlada via requirements
 ensure("supervision", "supervision==0.21.0")
-ensure("cv2", "opencv-python-headless==4.10.0.84")
+ensure_cv2_headless()
 ensure("lapx", "lapx>=0.5.9")
 
 # tentar streamlit-webrtc (opcional)
@@ -35,6 +43,9 @@ try:
     HAS_WEBRTC = True
 except Exception:
     HAS_WEBRTC = False
+
+# Agora é seguro importar cv2
+import cv2  # noqa
 
 # ============================================================
 # Imports principais do pipeline
@@ -46,7 +57,6 @@ import supervision as sv
 # ============================================================
 # Ajustes de cache p/ evitar arquivos corrompidos
 # ============================================================
-# Use um cache local controlado pelo app (evita colisões em ambientes gerenciados)
 os.environ.setdefault("ULTRALYTICS_CACHE_DIR", ".ultra_cache")
 try:
     os.makedirs(os.environ["ULTRALYTICS_CACHE_DIR"], exist_ok=True)
@@ -54,30 +64,18 @@ except Exception:
     pass
 
 def _clean_ultralytics_cache_for(weights_name: str):
-    """
-    Remove arquivos possivelmente corrompidos do cache do Ultralytics/torch
-    relacionados ao 'weights_name' (ex.: 'yolov8n.pt').
-    """
     try:
         candidates = []
-        stem = os.path.splitext(os.path.basename(weights_name))[0]  # 'yolov8n' de 'yolov8n.pt'
-
-        # 1) Pasta padrão de pesos do Ultralytics (SETTINGS)
+        stem = os.path.splitext(os.path.basename(weights_name))[0]
         weights_dir = SETTINGS.get("weights_dir", None)
         if weights_dir and os.path.isdir(weights_dir):
             candidates += glob.glob(os.path.join(weights_dir, f"{stem}*"))
-
-        # 2) Nosso cache dedicado
         ultra_cache = os.environ.get("ULTRALYTICS_CACHE_DIR")
         if ultra_cache and os.path.isdir(ultra_cache):
             candidates += glob.glob(os.path.join(ultra_cache, "*"))
-
-        # 3) Cache do torch (às vezes armazena o download bruto)
         torch_home = os.environ.get("TORCH_HOME", os.path.join(os.path.expanduser("~"), ".cache", "torch"))
         if torch_home and os.path.isdir(torch_home):
             candidates += glob.glob(os.path.join(torch_home, "**", f"*{stem}*"), recursive=True)
-
-        # Remove arquivos/diretórios candidatos
         for p in set(candidates):
             try:
                 if os.path.isdir(p):
@@ -85,11 +83,9 @@ def _clean_ultralytics_cache_for(weights_name: str):
                 elif os.path.isfile(p):
                     os.remove(p)
             except Exception:
-                # não deixa a limpeza quebrar a execução
                 pass
     except Exception:
         pass
-
 
 # ============================================================
 # Streamlit UI
@@ -98,14 +94,10 @@ st.set_page_config(page_title="MotoTrack Vision - Streamlit", layout="wide")
 st.title("🏍️ MotoTrack Vision — YOLOv8 + ByteTrack (Streamlit)")
 st.caption("Detecção + Rastreamento de **motos** em vídeo, com métricas em tempo (quase) real, exportação CSV e MP4.")
 
-# -----------------------------
-# Abas principais
-# -----------------------------
 tab_sys, tab_app = st.tabs(["🖥️ Sistema", "🎬 Processamento"])
 
 with tab_sys:
     st.subheader("Informações do Sistema/GPU")
-    # Mostrar info de versões
     import platform
     st.write({
         "python": platform.python_version(),
@@ -113,7 +105,6 @@ with tab_sys:
         "opencv": cv2.__version__ if 'cv2' in globals() else None,
         "ultralytics": __import__("ultralytics").__version__,
     })
-    # Tentar mostrar nvidia-smi se existir
     import shutil as _shutil, subprocess as _subprocess
     if _shutil.which("nvidia-smi"):
         try:
@@ -125,9 +116,6 @@ with tab_sys:
         st.info("GPU NVIDIA não detectada (ou `nvidia-smi` indisponível).")
 
 with tab_app:
-    # -----------------------------
-    # Controles (sidebar)
-    # -----------------------------
     with st.sidebar:
         st.header("Parâmetros")
         model_name = st.selectbox("Modelo YOLO", ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"], index=0)
@@ -154,52 +142,33 @@ with tab_app:
 
     run_button = st.button("▶️ Processar vídeo enviado")
 
-    # -----------------------------
-    # Carregar modelo (cache com proteção contra .pt corrompido)
-    # -----------------------------
     @st.cache_resource(show_spinner=True)
     def load_model_safely(name: str):
-        """
-        Tenta carregar o YOLO. Se falhar por UnpicklingError/RuntimeError/ValueError,
-        limpa caches relevantes e re-tenta uma vez.
-        """
         try:
             return YOLO(name)
-        except (pickle.UnpicklingError, RuntimeError, ValueError) as e:
-            # Limpa coisas possivelmente quebradas e tenta novamente
+        except (pickle.UnpicklingError, RuntimeError, ValueError):
             _clean_ultralytics_cache_for(name)
             return YOLO(name)
 
     model = load_model_safely(model_name)
 
-    # -----------------------------
-    # Upload de vídeo
-    # -----------------------------
     uploaded = st.file_uploader(
         "Envie um arquivo de vídeo (mp4, avi, mov, mkv…)", type=None, accept_multiple_files=False
     )
 
-    # Layout principal
     video_col, metrics_col = st.columns([3, 1])
     frame_placeholder = video_col.empty()
     track_table_placeholder = metrics_col.empty()
     csv_preview_placeholder = st.empty()
 
-    # -----------------------------
-    # Utilitários
-    # -----------------------------
     def _save_to_temp(uploaded_file) -> str:
         suffix = os.path.splitext(uploaded_file.name)[-1] or ".mp4"
-        # mantém entrada separada por nome (evita sobrescrever)
         base = os.path.splitext(os.path.basename(uploaded_file.name))[0] or "input"
         temp_path = os.path.join(f"data_cache_input_{base}{suffix}")
         with open(temp_path, "wb") as f:
             f.write(uploaded_file.read())
         return temp_path
 
-    # -----------------------------
-    # Pipeline de processamento
-    # -----------------------------
     def process_video(input_path: str):
         writer = None
         unique_ids = set()
@@ -227,7 +196,6 @@ with tab_app:
                 try:
                     ids = result.boxes.id.cpu().numpy().tolist()
                 except Exception:
-                    # fallback seguro se vier tensor vazio/None inesperado
                     ids = []
                 for tid in ids:
                     unique_ids.add(int(tid))
@@ -256,7 +224,6 @@ with tab_app:
             metrics_col.metric("Motos únicas", str(len(unique_ids)))
 
             if len(unique_ids) > 0:
-                # mostra amostra dos últimos 10 IDs
                 try:
                     sample_ids = sorted(unique_ids)[-10:]
                 except Exception:
@@ -276,9 +243,6 @@ with tab_app:
             "logs": logs,
         }
 
-    # -----------------------------
-    # Execução
-    # -----------------------------
     summary = None
 
     if run_button:
