@@ -10,7 +10,8 @@ import numpy as np
 import streamlit as st
 
 # ============================================================
-# 🔧 Instalação/garantia de dependências
+# 🔧 Garantia de dependências (ajuda local/colab).
+#    Em produção (Streamlit Cloud) use requirements.txt.
 # ============================================================
 def ensure(pkg, pip_name=None):
     pip_name = pip_name or pkg
@@ -19,22 +20,28 @@ def ensure(pkg, pip_name=None):
     except Exception:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pip_name])
 
-# Evita conflito entre opencv "normal" e o headless
 def ensure_cv2_headless():
+    """
+    Garante que OpenCV seja a variante headless e evita conflito
+    com opencv-python/opencv-contrib.
+    """
     try:
         import cv2  # noqa
-        # se já existir cv2, checa se é headless; se não for, troca.
         if hasattr(cv2, "__file__") and "headless" not in (cv2.__file__ or "").lower():
-            subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", "opencv-python", "opencv-contrib-python"])
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "opencv-python-headless==4.10.0.84"])
+            subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y",
+                                   "opencv-python", "opencv-contrib-python"])
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                                   "opencv-python-headless==4.10.0.84"])
     except Exception:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "opencv-python-headless==4.10.0.84"])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                               "opencv-python-headless==4.10.0.84"])
 
 # essenciais
-ensure("ultralytics")  # versão controlada via requirements
+ensure("ultralytics")                                # versão controlada via requirements
 ensure("supervision", "supervision==0.21.0")
 ensure_cv2_headless()
 ensure("lapx", "lapx>=0.5.9")
+ensure("numpy", "numpy<2")
 
 # tentar streamlit-webrtc (opcional)
 try:
@@ -55,7 +62,7 @@ from ultralytics.utils import SETTINGS
 import supervision as sv
 
 # ============================================================
-# Ajustes de cache p/ evitar arquivos corrompidos
+# Cache dedicado do Ultralytics (evita colisões no Cloud)
 # ============================================================
 os.environ.setdefault("ULTRALYTICS_CACHE_DIR", ".ultra_cache")
 try:
@@ -64,18 +71,29 @@ except Exception:
     pass
 
 def _clean_ultralytics_cache_for(weights_name: str):
+    """
+    Remove arquivos possivelmente corrompidos do cache do Ultralytics/torch
+    relacionados ao 'weights_name' (ex.: 'yolov8n.pt').
+    """
     try:
         candidates = []
-        stem = os.path.splitext(os.path.basename(weights_name))[0]
+        stem = os.path.splitext(os.path.basename(weights_name))[0]  # 'yolov8n' de 'yolov8n.pt'
+
+        # 1) Pasta padrão de pesos do Ultralytics
         weights_dir = SETTINGS.get("weights_dir", None)
         if weights_dir and os.path.isdir(weights_dir):
             candidates += glob.glob(os.path.join(weights_dir, f"{stem}*"))
+
+        # 2) Nosso cache dedicado
         ultra_cache = os.environ.get("ULTRALYTICS_CACHE_DIR")
         if ultra_cache and os.path.isdir(ultra_cache):
             candidates += glob.glob(os.path.join(ultra_cache, "*"))
+
+        # 3) Cache do torch (às vezes armazena o download bruto)
         torch_home = os.environ.get("TORCH_HOME", os.path.join(os.path.expanduser("~"), ".cache", "torch"))
         if torch_home and os.path.isdir(torch_home):
             candidates += glob.glob(os.path.join(torch_home, "**", f"*{stem}*"), recursive=True)
+
         for p in set(candidates):
             try:
                 if os.path.isdir(p):
@@ -142,6 +160,9 @@ with tab_app:
 
     run_button = st.button("▶️ Processar vídeo enviado")
 
+    # -----------------------------
+    # Carregamento robusto do modelo
+    # -----------------------------
     @st.cache_resource(show_spinner=True)
     def load_model_safely(name: str):
         try:
@@ -152,15 +173,22 @@ with tab_app:
 
     model = load_model_safely(model_name)
 
+    # -----------------------------
+    # Upload de vídeo
+    # -----------------------------
     uploaded = st.file_uploader(
         "Envie um arquivo de vídeo (mp4, avi, mov, mkv…)", type=None, accept_multiple_files=False
     )
 
+    # Layout principal
     video_col, metrics_col = st.columns([3, 1])
     frame_placeholder = video_col.empty()
     track_table_placeholder = metrics_col.empty()
     csv_preview_placeholder = st.empty()
 
+    # -----------------------------
+    # Utilitários
+    # -----------------------------
     def _save_to_temp(uploaded_file) -> str:
         suffix = os.path.splitext(uploaded_file.name)[-1] or ".mp4"
         base = os.path.splitext(os.path.basename(uploaded_file.name))[0] or "input"
@@ -169,6 +197,9 @@ with tab_app:
             f.write(uploaded_file.read())
         return temp_path
 
+    # -----------------------------
+    # Pipeline de processamento
+    # -----------------------------
     def process_video(input_path: str):
         writer = None
         unique_ids = set()
@@ -243,6 +274,9 @@ with tab_app:
             "logs": logs,
         }
 
+    # -----------------------------
+    # Execução
+    # -----------------------------
     summary = None
 
     if run_button:
