@@ -1,7 +1,7 @@
-streamlit>=1.38,<2
-ultralytics>=8.2.0,<9
-torch==2.7.1
-torchvision==0.22.0
+streamlit==1.38.0
+ultralytics==8.0.196
+torch==2.4.1
+torchvision==0.19.1
 supervision==0.21.0
 opencv-python-headless==4.10.0.84
 lapx==0.5.9
