@@ -1,7 +1,9 @@
-streamlit
+streamlit==1.38.0
 ultralytics==8.0.196
+torch==2.4.1
+torchvision==0.19.1
 supervision==0.21.0
 opencv-python-headless==4.10.0.84
-numpy==1.26.4
-pandas
-lapx>=0.5.9
+lapx==0.5.9
+onnxruntime==1.18.1
+numpy<2

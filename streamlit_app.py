@@ -2,13 +2,18 @@ import os
 import cv2
 import time
 import sys
+import glob
+import pickle
+import shutil
 import importlib
 import subprocess
 import numpy as np
 import streamlit as st
 
 # ============================================================
-# 🔧 Verificação/instalação de dependências (caso falte)
+# 🔧 Instalação/garantia de dependências (fallback)
+#  - Em plataformas gerenciadas (Streamlit Cloud/Render), prefira requirements.txt
+#  - Isso aqui só dá uma ajudinha quando roda local/Colab
 # ============================================================
 def ensure(pkg, pip_name=None):
     pip_name = pip_name or pkg
@@ -31,11 +36,63 @@ try:
 except Exception:
     HAS_WEBRTC = False
 
+# ============================================================
+# Imports principais do pipeline
+# ============================================================
 from ultralytics import YOLO
+from ultralytics.utils import SETTINGS
 import supervision as sv
 
 # ============================================================
-# Configuração do app
+# Ajustes de cache p/ evitar arquivos corrompidos
+# ============================================================
+# Use um cache local controlado pelo app (evita colisões em ambientes gerenciados)
+os.environ.setdefault("ULTRALYTICS_CACHE_DIR", ".ultra_cache")
+try:
+    os.makedirs(os.environ["ULTRALYTICS_CACHE_DIR"], exist_ok=True)
+except Exception:
+    pass
+
+def _clean_ultralytics_cache_for(weights_name: str):
+    """
+    Remove arquivos possivelmente corrompidos do cache do Ultralytics/torch
+    relacionados ao 'weights_name' (ex.: 'yolov8n.pt').
+    """
+    try:
+        candidates = []
+        stem = os.path.splitext(os.path.basename(weights_name))[0]  # 'yolov8n' de 'yolov8n.pt'
+
+        # 1) Pasta padrão de pesos do Ultralytics (SETTINGS)
+        weights_dir = SETTINGS.get("weights_dir", None)
+        if weights_dir and os.path.isdir(weights_dir):
+            candidates += glob.glob(os.path.join(weights_dir, f"{stem}*"))
+
+        # 2) Nosso cache dedicado
+        ultra_cache = os.environ.get("ULTRALYTICS_CACHE_DIR")
+        if ultra_cache and os.path.isdir(ultra_cache):
+            candidates += glob.glob(os.path.join(ultra_cache, "*"))
+
+        # 3) Cache do torch (às vezes armazena o download bruto)
+        torch_home = os.environ.get("TORCH_HOME", os.path.join(os.path.expanduser("~"), ".cache", "torch"))
+        if torch_home and os.path.isdir(torch_home):
+            candidates += glob.glob(os.path.join(torch_home, "**", f"*{stem}*"), recursive=True)
+
+        # Remove arquivos/diretórios candidatos
+        for p in set(candidates):
+            try:
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                elif os.path.isfile(p):
+                    os.remove(p)
+            except Exception:
+                # não deixa a limpeza quebrar a execução
+                pass
+    except Exception:
+        pass
+
+
+# ============================================================
+# Streamlit UI
 # ============================================================
 st.set_page_config(page_title="MotoTrack Vision - Streamlit", layout="wide")
 st.title("🏍️ MotoTrack Vision — YOLOv8 + ByteTrack (Streamlit)")
@@ -54,12 +111,13 @@ with tab_sys:
         "python": platform.python_version(),
         "numpy": np.__version__ if 'np' in globals() else None,
         "opencv": cv2.__version__ if 'cv2' in globals() else None,
+        "ultralytics": __import__("ultralytics").__version__,
     })
     # Tentar mostrar nvidia-smi se existir
-    import shutil, subprocess
-    if shutil.which("nvidia-smi"):
+    import shutil as _shutil, subprocess as _subprocess
+    if _shutil.which("nvidia-smi"):
         try:
-            out = subprocess.check_output(["nvidia-smi"], text=True)
+            out = _subprocess.check_output(["nvidia-smi"], text=True)
             st.code(out)
         except Exception as e:
             st.warning(f"Falha ao executar nvidia-smi: {e}")
@@ -83,21 +141,36 @@ with tab_app:
         st.markdown("---")
         if st.button("♻️ Limpar estado"):
             for k in list(st.session_state.keys()):
-                del st.session_state[k]
-            st.cache_resource.clear()
-            st.cache_data.clear()
-            st.experimental_rerun()
+                try:
+                    del st.session_state[k]
+                except Exception:
+                    pass
+            try:
+                st.cache_resource.clear()
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.rerun()
 
     run_button = st.button("▶️ Processar vídeo enviado")
 
     # -----------------------------
-    # Carregar modelo (cache)
+    # Carregar modelo (cache com proteção contra .pt corrompido)
     # -----------------------------
     @st.cache_resource(show_spinner=True)
-    def load_model(name: str):
-        return YOLO(name)
+    def load_model_safely(name: str):
+        """
+        Tenta carregar o YOLO. Se falhar por UnpicklingError/RuntimeError/ValueError,
+        limpa caches relevantes e re-tenta uma vez.
+        """
+        try:
+            return YOLO(name)
+        except (pickle.UnpicklingError, RuntimeError, ValueError) as e:
+            # Limpa coisas possivelmente quebradas e tenta novamente
+            _clean_ultralytics_cache_for(name)
+            return YOLO(name)
 
-    model = load_model(model_name)
+    model = load_model_safely(model_name)
 
     # -----------------------------
     # Upload de vídeo
@@ -117,7 +190,9 @@ with tab_app:
     # -----------------------------
     def _save_to_temp(uploaded_file) -> str:
         suffix = os.path.splitext(uploaded_file.name)[-1] or ".mp4"
-        temp_path = os.path.join("data_cache_input" + suffix)
+        # mantém entrada separada por nome (evita sobrescrever)
+        base = os.path.splitext(os.path.basename(uploaded_file.name))[0] or "input"
+        temp_path = os.path.join(f"data_cache_input_{base}{suffix}")
         with open(temp_path, "wb") as f:
             f.write(uploaded_file.read())
         return temp_path
@@ -149,7 +224,11 @@ with tab_app:
 
             ids = []
             if result.boxes is not None and result.boxes.id is not None:
-                ids = result.boxes.id.cpu().numpy().tolist()
+                try:
+                    ids = result.boxes.id.cpu().numpy().tolist()
+                except Exception:
+                    # fallback seguro se vier tensor vazio/None inesperado
+                    ids = []
                 for tid in ids:
                     unique_ids.add(int(tid))
 
@@ -177,7 +256,12 @@ with tab_app:
             metrics_col.metric("Motos únicas", str(len(unique_ids)))
 
             if len(unique_ids) > 0:
-                track_table_placeholder.write({"IDs rastreadas (amostra)": sorted(unique_ids)[-10:]})
+                # mostra amostra dos últimos 10 IDs
+                try:
+                    sample_ids = sorted(unique_ids)[-10:]
+                except Exception:
+                    sample_ids = list(unique_ids)[:10]
+                track_table_placeholder.write({"IDs rastreadas (amostra)": sample_ids})
 
             if max_frames and frame_count >= max_frames:
                 break
@@ -221,4 +305,3 @@ with tab_app:
                     file_name="rastreamento_motos.csv",
                     mime="text/csv",
                 )
-
